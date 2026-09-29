@@ -1,0 +1,835 @@
+<?php
+require_once 'db.php';
+require_once 'config.php';
+
+if (!isset($_SESSION['admin_logged_in'])) {
+    header('Location: registration.php');
+    exit;
+}
+
+// CSRF Protection
+if (!isset($_SESSION['csrf']) || !isset($_SESSION['csrf']['value']) || time() >= (int)($_SESSION['csrf']['expires'] ?? 0)) {
+    $_SESSION['csrf'] = [
+        'value' => bin2hex(random_bytes(32)),
+        'expires' => time() + 900
+    ];
+}
+
+function validate_csrf_registrants($token) {
+    if (!isset($_SESSION['csrf']['value']) || !isset($_SESSION['csrf']['expires'])) return false;
+    if (time() >= (int)$_SESSION['csrf']['expires']) return false;
+    return hash_equals($_SESSION['csrf']['value'], (string)$token);
+}
+
+// Handle Bulk Delete
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'delete_bulk') {
+    $csrf = $_POST['csrf_token'] ?? '';
+    if (!validate_csrf_registrants($csrf)) {
+        $_SESSION['di'] = ['type' => 'error', 'title' => 'Security', 'message' => 'Security check failed. Please try again.'];
+        header('Location: registrants.php');
+        exit;
+    }
+    
+    $rawIds = $_POST['bulk_ids'] ?? '';
+    $ids = explode(',', $rawIds);
+    $ids = array_filter($ids, 'ctype_digit');
+    $ids = array_values($ids);
+    
+    if (empty($ids)) {
+        $_SESSION['di'] = ['type'=>'error','title'=>'Error','message'=>'Invalid selection'];
+        header('Location: registrants.php');
+        exit;
+    }
+    
+    $placeholders = implode(',', array_fill(0, count($ids), '?'));
+    $stmt = $pdo->prepare("DELETE FROM registrants_tbl WHERE id IN ($placeholders)");
+    $stmt->execute($ids);
+    if (function_exists('admin_notify')) {
+        admin_notify($pdo, 'registrants', 'Bulk Delete', count($ids) . ' registrants deleted.', 'registrants.php');
+    }
+    $_SESSION['flash'] = count($ids) . " registrants deleted successfully.";
+    $_SESSION['di'] = ['type'=>'warn','title'=>'Deleted','message'=>$_SESSION['flash']];
+    header('Location: registrants.php');
+    exit;
+}
+
+// Handle CSV Export
+if (isset($_GET['export']) && $_GET['export'] === 'csv') {
+    header('Content-Type: text/csv');
+    header('Content-Disposition: attachment; filename="registrants_export.csv"');
+    $out = fopen('php://output', 'w');
+    // Add BOM for Excel UTF-8 support
+    fprintf($out, chr(0xEF).chr(0xBB).chr(0xBF));
+    
+    fputcsv($out, ['Full Name', 'Email', 'Phone', 'Registration Date', 'Webinar Category', 'Status', 'Investor', 'Liquid $50k+', 'Timeline']);
+    
+    $stmt = $pdo->query("SELECT r.fullname, r.email, r.phone, r.registration_date, w.title as webinar_title, r.email_sent, r.is_accredited, r.liquid_50000, r.deploy_timeline 
+                         FROM registrants_tbl r 
+                         LEFT JOIN webinar_tbl w ON r.webinar_id = w.webinar_id 
+                         ORDER BY r.id DESC");
+                         
+    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        // Format dates cleanly
+        $regDate = strtotime($row['registration_date']);
+        $formattedDate = ($regDate > 0 && date('Y', $regDate) != '1969') ? date('M d, Y', $regDate) : 'N/A';
+
+        $data = [
+            $row['fullname'],
+            $row['email'],
+            $row['phone'] ?: 'N/A',
+            $formattedDate,
+            $row['webinar_title'] ?? 'Uncategorized',
+            $row['email_sent'] ? 'Sent' : 'Pending',
+            $row['is_accredited'] ? 'Yes' : 'No',
+            $row['liquid_50000'] ? 'Yes' : 'No',
+            $row['deploy_timeline'] ?: 'N/A'
+        ];
+        fputcsv($out, $data);
+    }
+    fclose($out);
+    exit;
+}
+
+// Search & Filter Params
+$search = isset($_GET['search']) ? trim($_GET['search']) : '';
+$category = isset($_GET['category']) ? trim($_GET['category']) : '';
+$status_filter = isset($_GET['status']) ? trim($_GET['status']) : 'all';
+
+// Build WHERE clause
+$where_clauses = [];
+$params = [];
+
+if ($search !== '') {
+    $where_clauses[] = "(r.fullname LIKE ? OR r.email LIKE ? OR r.phone LIKE ?)";
+    $params[] = "%$search%";
+    $params[] = "%$search%";
+    $params[] = "%$search%";
+}
+
+if ($category !== '') {
+    $where_clauses[] = "w.title = ?";
+    $params[] = $category;
+}
+
+if ($status_filter === 'sent') {
+    $where_clauses[] = "r.email_sent = 1";
+} elseif ($status_filter === 'pending') {
+    $where_clauses[] = "r.email_sent = 0";
+}
+
+$where_sql = count($where_clauses) > 0 ? "WHERE " . implode(" AND ", $where_clauses) : "";
+
+// Pagination Logic
+$limit = 10;
+$page = isset($_GET['page']) ? max(1, (int)$_GET['page']) : 1;
+$offset = ($page - 1) * $limit;
+
+// Fetch Data
+$total_stmt = $pdo->prepare("SELECT COUNT(*) FROM registrants_tbl r LEFT JOIN webinar_tbl w ON r.webinar_id = w.webinar_id $where_sql");
+$total_stmt->execute($params);
+$total_registrants = $total_stmt->fetchColumn();
+$total_pages = ceil($total_registrants / $limit);
+
+$query = "SELECT r.*, w.title as webinar_title 
+          FROM registrants_tbl r 
+          LEFT JOIN webinar_tbl w ON r.webinar_id = w.webinar_id 
+          $where_sql 
+          ORDER BY r.id DESC 
+          LIMIT $limit OFFSET $offset";
+$registrants = $pdo->prepare($query);
+$registrants->execute($params);
+$registrants = $registrants->fetchAll(PDO::FETCH_ASSOC);
+
+// Fetch Webinars for Filtering
+$webinars = $pdo->query("SELECT DISTINCT title FROM webinar_tbl ORDER BY title ASC")->fetchAll(PDO::FETCH_COLUMN);
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Registrants ¡¤ Mioym Equities</title>
+    <link rel="icon" type="image/png" href="img/logo.png">
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="dynamic-island.js"></script>
+    <style>
+        body { font-family: 'Plus Jakarta Sans', sans-serif; }
+        .sticky-header th { position: sticky; top: 0; background: #f8fafc; z-index: 10; }
+        .zebra-stripes tr:nth-child(even) { background-color: #f8fafc; }
+        .loading-spinner { animation: spin 1s linear infinite; }
+        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        [x-cloak] { display: none !important; }
+        
+        /* Specific dark mode fixes for registrants */
+        body.dark-theme .bg-blue-50\/30 { background-color: rgba(30, 58, 138, 0.15) !important; }
+        body.dark-theme .hover\:bg-blue-50\/30:hover { background-color: rgba(30, 58, 138, 0.25) !important; }
+        body.dark-theme .bg-emerald-100\/50 { background-color: rgba(16, 185, 129, 0.15) !important; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 font-sans antialiased min-h-screen overflow-hidden">
+
+    <div class="flex h-screen overflow-hidden">
+        
+        <?php include 'sidebar.php'; ?>
+
+        <!-- Main Content -->
+        <main class="flex-1 overflow-y-auto bg-slate-50 p-8">
+            <div class="flex flex-col gap-6 mb-8">
+                <div class="flex justify-between items-center">
+                    <div>
+                        <h2 class="text-2xl font-bold text-slate-800 tracking-tight">Registrant Management</h2>
+                        <p class="text-slate-500 text-sm mt-1">Manage, track, and engage with your webinar registrants.</p>
+                    </div>
+                    
+                    <div class="flex items-center gap-3">
+                        <!-- Bulk Actions Toolbar (Hidden by default) -->
+                        <div id="bulk-toolbar" class="hidden flex items-center gap-2 bg-emerald-50 px-3 py-1.5 rounded-xl border border-emerald-100 mr-2">
+                            <span class="text-xs font-semibold text-emerald-700"><span id="selected-count">0</span> Selected</span>
+                            <div class="h-4 w-px bg-emerald-200 mx-1"></div>
+                            <button onclick="handleBulkAction('send')" class="text-xs font-bold text-emerald-600 hover:text-emerald-700 transition flex items-center gap-1.5">
+                                <i class="fas fa-paper-plane text-[10px]"></i> Bulk Send
+                            </button>
+                            <button onclick="handleBulkAction('delete')" class="text-xs font-bold text-rose-600 hover:text-rose-700 transition flex items-center gap-1.5">
+                                <i class="fas fa-trash-alt text-[10px]"></i> Bulk Delete
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Search & Filtering Suite -->
+                <form method="GET" action="registrants.php" class="bg-white p-4 rounded-2xl shadow-sm border border-slate-100 flex flex-wrap items-center gap-4">
+                    <div class="relative flex-1 min-w-[300px]">
+                        <i class="fas fa-search absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 text-sm"></i>
+                        <input type="text" name="search" id="table-search" placeholder="Search by name, email or phone..."
+                               value="<?php echo htmlspecialchars($search); ?>"
+                               class="w-full pl-11 pr-4 py-2.5 bg-slate-50 border border-slate-100 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition">
+                    </div>
+
+                    <div class="flex items-center gap-4">
+                        <select name="category" id="filter-category" onchange="this.form.submit()" class="px-4 py-2.5 bg-slate-50 border border-slate-100 rounded-xl text-sm font-medium focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition">
+                            <option value="">All Webinars</option>
+                            <?php foreach($webinars as $w): ?>
+                                <option value="<?php echo htmlspecialchars($w); ?>" <?php echo $category === $w ? 'selected' : ''; ?>><?php echo htmlspecialchars($w); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+
+                        <div class="flex bg-slate-50 p-1 rounded-xl border border-slate-100">
+                            <input type="hidden" name="status" id="status-input" value="<?php echo htmlspecialchars($status_filter); ?>">
+                            <button type="button" onclick="filterStatus('all')" class="status-btn px-4 py-1.5 rounded-lg text-xs font-bold transition <?php echo $status_filter === 'all' ? 'bg-white shadow-sm text-blue-600' : 'text-slate-500 hover:text-slate-700'; ?>">All</button>
+                            <button type="button" onclick="filterStatus('sent')" class="status-btn px-4 py-1.5 rounded-lg text-xs font-bold transition <?php echo $status_filter === 'sent' ? 'bg-white shadow-sm text-blue-600' : 'text-slate-500 hover:text-slate-700'; ?>">Sent</button>
+                            <button type="button" onclick="filterStatus('pending')" class="status-btn px-4 py-1.5 rounded-lg text-xs font-bold transition <?php echo $status_filter === 'pending' ? 'bg-white shadow-sm text-blue-600' : 'text-slate-500 hover:text-slate-700'; ?>">Pending</button>
+                        </div>
+                        
+                        <a href="?export=csv" class="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2.5 rounded-xl text-sm font-bold transition-all shadow-sm hover:shadow-emerald-200" title="Export to Excel/CSV">
+                            <i class="fas fa-file-excel"></i>
+                            <span class="hidden sm:inline">Export</span>
+                        </a>
+                        
+                        <button type="submit" class="hidden"></button> <!-- For enter key -->
+                    </div>
+                </form>
+            </div>
+
+            <div id="registrants-container" class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+                <div class="max-h-[calc(100vh-320px)] overflow-auto">
+                    <table id="registrants-table" class="w-full min-w-full text-left border-collapse <?php echo empty($registrants) ? 'hidden' : ''; ?>">
+                        <thead class="sticky-header">
+                            <tr class="bg-slate-50 border-b border-slate-200 text-xs font-bold text-slate-500 uppercase tracking-wider">
+                                <th class="p-4 w-12">
+                                    <div class="flex items-center justify-center">
+                                        <input type="checkbox" id="select-all" class="w-4 h-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500">
+                                    </div>
+                                </th>
+                                <th class="p-4">Registrant Name</th>
+                                <th class="p-4">Contact Info</th>
+                                <th class="p-4">Mobile number</th>
+                                <th class="p-4">Webinar Category</th>
+                                <th class="p-4">Reg. Date</th>
+                                <th class="p-4 text-center">Status</th>
+                                <th class="p-4 text-center">Investor</th>
+                                <th class="p-4 text-center">Liquid $50k+</th>
+                                <th class="p-4 text-center">Timeline</th>
+                                <th class="p-4 text-right">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-slate-100 text-sm zebra-stripes">
+                            <?php foreach($registrants as $r): 
+                                $status = $r['email_sent'] ? 'sent' : 'pending';
+                                $regDate = strtotime($r['registration_date']);
+                                $formattedDate = ($regDate > 0 && date('Y', $regDate) != '1969' && date('Y', $regDate) != '-0001') 
+                                    ? date('M d, Y', $regDate) 
+                                    : '<span class="text-slate-300 text-xs font-medium bg-slate-50 px-2 py-0.5 rounded-md">N/A</span>';
+                            ?>
+                            <tr class="hover:bg-blue-50/30 transition-colors group">
+                                
+                                <td class="p-4 text-center">
+                                    <input type="checkbox" class="row-select w-4 h-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" data-id="<?php echo $r['id']; ?>">
+                                </td>
+                                
+                                <td class="p-4">
+                                    <div class="font-semibold text-slate-800"><?php echo htmlspecialchars($r['fullname']); ?></div>
+                                    <div class="text-[10px] text-slate-400 font-bold uppercase mt-0.5">ID: #<?php echo str_pad($r['id'], 5, '0', STR_PAD_LEFT); ?></div>
+                                </td>
+                                
+                                <td class="p-4">
+                                    <div class="flex items-center gap-3">
+                                        <span class="text-slate-600 text-xs font-medium"><?php echo htmlspecialchars($r['email']); ?></span>
+                                        <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                            <a href="mailto:<?php echo $r['email']; ?>" class="w-7 h-7 flex items-center justify-center bg-blue-50 text-blue-500 rounded-lg hover:bg-blue-100 transition" title="Email Registrant">
+                                                <i class="far fa-envelope text-xs"></i>
+                                            </a>
+                                        </div>
+                                    </div>
+                                </td>
+                                
+                                <td class="p-4">
+                                    <?php if($r['phone']): ?>
+                                        <div class="flex items-center gap-3">
+                                            <div class="flex items-center gap-2">
+                                                <?php if(!empty($r['country_code'])): ?>
+                                                    <img src="https://flagcdn.com/w20/<?php echo strtolower($r['country_code']); ?>.png" 
+                                                         alt="<?php echo strtoupper($r['country_code']); ?>" 
+                                                         class="w-5 h-auto rounded-sm shadow-sm"
+                                                         title="<?php echo strtoupper($r['country_code']); ?>">
+                                                <?php endif; ?>
+                                                <span class="text-slate-600 text-xs font-medium"><?php echo htmlspecialchars($r['phone']); ?></span>
+                                            </div>
+                                            <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                                <a href="tel:<?php echo $r['phone']; ?>" class="w-7 h-7 flex items-center justify-center bg-emerald-50 text-emerald-500 rounded-lg hover:bg-emerald-100 transition" title="Call Registrant">
+                                                    <i class="fas fa-phone-alt text-xs"></i>
+                                                </a>
+                                            </div>
+                                        </div>
+                                    <?php else: ?>
+                                        <span class="text-slate-300 italic text-xs">Not provided</span>
+                                    <?php endif; ?>
+                                </td>
+                                
+                                <td class="p-4">
+                                    <span class="px-2.5 py-1 rounded-lg bg-slate-100 text-slate-600 text-xs font-semibold">
+                                        <?php echo $r['webinar_title'] ? htmlspecialchars($r['webinar_title']) : 'Uncategorized'; ?>
+                                    </span>
+                                </td>
+                                
+                                <td class="p-4 text-slate-500 font-medium whitespace-nowrap">
+                                    <?php echo $formattedDate; ?>
+                                </td>
+                                
+                                <td class="p-4 text-center">
+                                    <?php if($r['email_sent']): ?>
+                                        <span class="inline-flex items-center gap-1.5 bg-emerald-100/50 text-emerald-600 px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider">
+                                            <i class="fas fa-check-circle"></i> Sent
+                                        </span>
+                                    <?php else: ?>
+                                        <span class="inline-flex items-center gap-1.5 bg-slate-100 text-slate-500 px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider">
+                                            <i class="fas fa-clock"></i> Pending
+                                        </span>
+                                    <?php endif; ?>
+                                </td>
+                                
+                                <td class="p-4 text-center">
+                                    <?php if(!empty($r['is_accredited'])): ?>
+                                        <span class="inline-flex items-center gap-1.5 bg-amber-100 text-amber-700 px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider">
+                                            <i class="fas fa-star"></i> Yes
+                                        </span>
+                                    <?php else: ?>
+                                        <span class="inline-flex items-center gap-1.5 bg-slate-100 text-slate-500 px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider">
+                                            <i class="fas fa-minus"></i> No
+                                        </span>
+                                    <?php endif; ?>
+                                </td>
+                                
+                                <td class="p-4 text-center">
+                                    <?php if(!empty($r['liquid_50000'])): ?>
+                                        <span class="inline-flex items-center gap-1.5 bg-blue-100 text-blue-700 px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider">
+                                            <i class="fas fa-check-circle"></i> Yes
+                                        </span>
+                                    <?php else: ?>
+                                        <span class="inline-flex items-center gap-1.5 bg-slate-100 text-slate-500 px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider">
+                                            <i class="fas fa-minus"></i> No
+                                        </span>
+                                    <?php endif; ?>
+                                </td>
+
+                                <td class="p-4 text-center">
+                                    <span class="text-slate-600 text-xs font-semibold">
+                                        <?php echo !empty($r['deploy_timeline']) ? htmlspecialchars($r['deploy_timeline']) : '<span class="text-slate-300 italic">N/A</span>'; ?>
+                                    </span>
+                                </td>
+                                
+                                <td class="p-4 text-right whitespace-nowrap">
+                                    <button type="button" 
+                                            onclick="openReminderModal(<?php echo $r['id']; ?>, <?php echo $r['reminded_1w'] ? 'true' : 'false'; ?>, <?php echo $r['reminded_1d'] ? 'true' : 'false'; ?>, <?php echo $r['reminded_1h'] ? 'true' : 'false'; ?>)" 
+                                            class="inline-flex items-center justify-center w-8 h-8 rounded-xl bg-indigo-50 text-indigo-500 hover:bg-indigo-100 transition mr-2" title="Monitor Reminders">
+                                        <i class="fas fa-chart-line text-xs"></i>
+                                    </button>
+                                    
+                                    <form method="POST" action="emails.php" class="send-email-form inline">
+                                        <input type="hidden" name="action" value="send_emails">
+                                        <input type="hidden" name="registrant_id" value="<?php echo $r['id']; ?>">
+                                        <input type="hidden" name="email_template" value="Hi [Name],&#10;&#10;Here is your webinar link: [Link]&#10;&#10;See you there!">
+                                        
+                                        <?php if($r['email_sent']): ?>
+                                            <button type="button" disabled class="inline-flex items-center gap-2 bg-slate-100 text-slate-400 px-4 py-1.5 rounded-xl text-xs font-bold cursor-not-allowed border border-slate-200" title="Email already sent">
+                                                <i class="fas fa-check text-[10px]"></i>
+                                                <span>Sent</span>
+                                            </button>
+                                        <?php else: ?>
+                                            <button type="button" 
+                                                    id="send-btn-<?php echo $r['id']; ?>"
+                                                    onclick="openSendModal(<?php echo $r['id']; ?>, '<?php echo addslashes(htmlspecialchars($r['fullname'])); ?>')" 
+                                                    class="send-btn inline-flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-4 py-1.5 rounded-xl text-xs font-bold transition-all shadow-sm hover:shadow-blue-200" title="Send Email">
+                                                <i class="fas fa-paper-plane text-[10px]"></i>
+                                                <span class="btn-text">Send</span>
+                                            </button>
+                                        <?php endif; ?>
+                                    </form>
+                                </td>
+                            </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- Empty State -->
+                <div id="empty-state" class="<?php echo empty($registrants) ? '' : 'hidden'; ?> py-20 text-center">
+                    <div class="w-20 h-20 bg-slate-50 rounded-full flex items-center justify-center mx-auto mb-4">
+                        <i class="fas fa-search text-slate-300 text-3xl"></i>
+                    </div>
+                    <h3 class="text-slate-800 font-bold text-lg">No registrants found</h3>
+                    <p class="text-slate-500 text-sm mt-1">Try adjusting your filters or search terms.</p>
+                    <button onclick="resetFilters()" class="mt-4 text-blue-600 font-bold text-sm hover:underline">Clear all filters</button>
+                </div>
+
+                <!-- Pagination UI -->
+                <?php if($total_pages > 1): ?>
+                <div class="p-5 border-t border-slate-100 flex items-center justify-between bg-slate-50/30">
+                    <div class="text-xs font-bold text-slate-400 uppercase tracking-widest">
+                        Showing <?php echo $offset + 1; ?>-<?php echo min($offset + $limit, $total_registrants); ?> of <?php echo $total_registrants; ?> registrants
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <?php 
+                        $query_params = $_GET;
+                        function getPageUrl($p, $params) {
+                            $params['page'] = $p;
+                            return '?' . http_build_query($params);
+                        }
+                        ?>
+                        <?php if($page > 1): ?>
+                            <a href="<?php echo getPageUrl($page - 1, $query_params); ?>" class="w-9 h-9 flex items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-600 hover:bg-slate-50 transition shadow-sm">
+                                <i class="fas fa-chevron-left text-xs"></i>
+                            </a>
+                        <?php endif; ?>
+
+                        <?php 
+                        $start_range = max(1, $page - 2);
+                        $end_range = min($total_pages, $page + 2);
+                        for($i = $start_range; $i <= $end_range; $i++): 
+                        ?>
+                            <a href="<?php echo getPageUrl($i, $query_params); ?>" class="w-9 h-9 flex items-center justify-center rounded-xl border <?php echo $i === $page ? 'bg-[#1e4a7a] border-[#1e4a7a] text-white shadow-md shadow-blue-900/20' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50 transition shadow-sm'; ?> text-xs font-bold">
+                                <?php echo $i; ?>
+                            </a>
+                        <?php endfor; ?>
+
+                        <?php if($page < $total_pages): ?>
+                            <a href="<?php echo getPageUrl($page + 1, $query_params); ?>" class="w-9 h-9 flex items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-600 hover:bg-slate-50 transition shadow-sm">
+                                <i class="fas fa-chevron-right text-xs"></i>
+                            </a>
+                        <?php endif; ?>
+                    </div>
+                </div>
+                <?php endif; ?>
+            </div>
+        </main>
+    </div>
+
+    <!-- Hidden Forms for Bulk Actions -->
+    <form id="bulk-send-form" method="POST" action="emails.php" class="hidden">
+        <input type="hidden" name="action" value="send_emails">
+        <input type="hidden" name="bulk_ids" id="bulk-send-ids">
+        <input type="hidden" name="email_template" value="Hi [Name],&#10;&#10;Here is your webinar link: [Link]&#10;&#10;See you there!">
+    </form>
+
+    <form id="bulk-delete-form" method="POST" action="registrants.php" class="hidden">
+        <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf']['value']); ?>">
+        <input type="hidden" name="action" value="delete_bulk">
+        <input type="hidden" name="bulk_ids" id="bulk-delete-ids">
+    </form>
+
+    <!-- Email Send Confirmation Modal -->
+    <div id="sendEmailModal" class="fixed inset-0 z-[100] hidden">
+        <div class="absolute inset-0 bg-slate-950/60 backdrop-blur-sm animate-in fade-in duration-300"></div>
+        <div class="absolute inset-0 flex items-center justify-center p-4">
+            <div class="bg-white rounded-[2.5rem] w-full max-w-md overflow-hidden shadow-2xl animate-in zoom-in-95 duration-300">
+                <div class="p-8 text-center">
+                    <div class="w-20 h-20 bg-blue-50 rounded-full flex items-center justify-center mx-auto mb-6">
+                        <i class="fas fa-paper-plane text-3xl text-blue-600"></i>
+                    </div>
+                    <h3 class="text-2xl font-black text-slate-900 tracking-tight mb-2">Send Email?</h3>
+                    <p class="text-slate-500 font-medium leading-relaxed mb-8">
+                        Are you sure you want to send the webinar invitation to <span id="sendRegistrantName" class="font-bold text-slate-900"></span>?
+                    </p>
+                    
+                    <div class="flex flex-col gap-3">
+                        <button type="button" onclick="confirmSend()" class="w-full py-4 bg-blue-600 hover:bg-blue-700 text-white font-black rounded-2xl transition-all shadow-lg shadow-blue-200">
+                            Yes, Send Now
+                        </button>
+                        <button type="button" onclick="closeSendModal()" class="w-full py-4 bg-slate-100 hover:bg-slate-200 text-slate-600 font-black rounded-2xl transition-all">
+                            Cancel
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Reminder Monitoring Modal -->
+    <div id="reminderModal" class="fixed inset-0 z-[100] hidden">
+        <div class="absolute inset-0 bg-slate-950/60 backdrop-blur-sm animate-in fade-in duration-300" onclick="closeReminderModal()"></div>
+        <div class="absolute inset-0 flex items-center justify-center p-4 pointer-events-none">
+            <div class="bg-white rounded-[2.5rem] w-full max-w-sm overflow-hidden shadow-2xl animate-in zoom-in-95 duration-300 pointer-events-auto">
+                <div class="p-8">
+                    <div class="flex items-center justify-between mb-6">
+                        <div class="flex items-center gap-3">
+                            <div class="w-12 h-12 bg-indigo-50 text-indigo-600 rounded-full flex items-center justify-center text-xl">
+                                <i class="fas fa-chart-line"></i>
+                            </div>
+                            <h3 class="text-xl font-black text-slate-900 tracking-tight">Reminders</h3>
+                        </div>
+                        <button type="button" onclick="closeReminderModal()" class="w-8 h-8 rounded-full bg-slate-50 text-slate-400 hover:text-slate-600 flex items-center justify-center transition-colors">
+                            <i class="fas fa-times"></i>
+                        </button>
+                    </div>
+                    
+                    <div class="space-y-4">
+                        <!-- 1 Week -->
+                        <div class="flex items-center justify-between p-4 rounded-2xl bg-slate-50 border border-slate-100">
+                            <div class="flex items-center gap-3">
+                                <i class="far fa-calendar-alt text-slate-400"></i>
+                                <span class="text-sm font-bold text-slate-700">1 Week Before</span>
+                            </div>
+                            <div id="remStatus1w"></div>
+                        </div>
+                        
+                        <!-- 1 Day -->
+                        <div class="flex items-center justify-between p-4 rounded-2xl bg-slate-50 border border-slate-100">
+                            <div class="flex items-center gap-3">
+                                <i class="fas fa-sun text-slate-400"></i>
+                                <span class="text-sm font-bold text-slate-700">1 Day Before</span>
+                            </div>
+                            <div id="remStatus1d"></div>
+                        </div>
+                        
+                        <!-- 1 Hour -->
+                        <div class="flex items-center justify-between p-4 rounded-2xl bg-slate-50 border border-slate-100">
+                            <div class="flex items-center gap-3">
+                                <i class="far fa-clock text-slate-400"></i>
+                                <span class="text-sm font-bold text-slate-700">1 Hour Before</span>
+                            </div>
+                            <div id="remStatus1h"></div>
+                        </div>
+                        
+                    </div>
+                    
+                    <div class="flex flex-col gap-3 mt-6">
+                        <button type="button" id="forceRunCronBtn" onclick="forceRunCronJobs()" class="w-full py-3.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl transition-all shadow-lg shadow-amber-500/20 flex items-center justify-center gap-2">
+                            <i class="fas fa-sync-alt"></i> Force Run Reminders
+                        </button>
+                        <button type="button" onclick="closeReminderModal()" class="w-full py-3.5 bg-slate-900 hover:bg-slate-800 text-white font-bold rounded-xl transition-all shadow-lg shadow-slate-200">
+                            Done
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const tableSearch = document.getElementById('table-search');
+        const filterCategory = document.getElementById('filter-category');
+        const statusInput = document.getElementById('status-input');
+        const statusBtns = document.querySelectorAll('.status-btn');
+        const selectAll = document.getElementById('select-all');
+        const rowCheckboxes = document.querySelectorAll('.row-select');
+        const bulkToolbar = document.getElementById('bulk-toolbar');
+        const selectedCount = document.getElementById('selected-count');
+
+        // Guard against null elements
+        if (!bulkToolbar || !selectedCount) {
+            console.log('Bulk toolbar elements not found, skipping selection logic');
+        } else {
+            window.filterStatus = (status) => {
+                statusInput.value = status;
+                statusInput.form.submit();
+            };
+
+            window.resetFilters = () => {
+                window.location.href = 'registrants.php';
+            };
+
+            // Selection Logic
+            function updateBulkToolbar() {
+                const selected = Array.from(rowCheckboxes).filter(cb => cb.checked).length;
+                selectedCount.textContent = selected;
+                bulkToolbar.classList.toggle('hidden', selected === 0);
+            }
+
+            if (selectAll) {
+                selectAll.addEventListener('change', () => {
+                    const isChecked = selectAll.checked;
+                    rowCheckboxes.forEach(cb => {
+                        cb.checked = isChecked;
+                    });
+                    updateBulkToolbar();
+                });
+            }
+
+            if (rowCheckboxes) {
+                rowCheckboxes.forEach(cb => {
+                    cb.addEventListener('change', updateBulkToolbar);
+                });
+            }
+        }
+
+        // --- Single Send Logic with Modal & Cooldown ---
+        const sendModal = document.getElementById('sendEmailModal');
+        const sendRegistrantName = document.getElementById('sendRegistrantName');
+        let currentRegistrantId = null;
+
+        window.openSendModal = (id, name) => {
+            currentRegistrantId = id;
+            sendRegistrantName.innerText = name;
+            sendModal.classList.remove('hidden');
+        };
+
+        window.closeSendModal = () => {
+            sendModal.classList.add('hidden');
+            currentRegistrantId = null;
+        };
+
+        window.confirmSend = () => {
+            if (!currentRegistrantId) return;
+            
+            const btn = document.getElementById(`send-btn-${currentRegistrantId}`);
+            const form = btn.closest('form');
+            
+            closeSendModal();
+            
+            // Show processing state in Dynamic Island
+            if (window.DynamicIsland) {
+                DynamicIsland.info(`Sending email to ${sendRegistrantName.innerText}...`, 'Processing');
+            }
+
+            // Visual feedback on button
+            btn.disabled = true;
+            btn.classList.add('opacity-80', 'cursor-not-allowed');
+            btn.innerHTML = `<i class="fas fa-circle-notch loading-spinner text-[10px]"></i> <span>Sending...</span>`;
+            
+            // Handle cooldown in localStorage
+            const cooldownTime = Date.now() + 60000; // 1 minute
+            localStorage.setItem(`email_cooldown_${currentRegistrantId}`, cooldownTime);
+            
+            setTimeout(() => {
+                form.submit();
+            }, 800);
+        };
+
+        // Cooldown Timer Implementation
+        function checkCooldowns() {
+            const now = Date.now();
+            document.querySelectorAll('.send-btn').forEach(btn => {
+                const id = btn.id.split('-').pop();
+                const expiry = localStorage.getItem(`email_cooldown_${id}`);
+                
+                if (expiry && now < expiry) {
+                    const remaining = Math.ceil((expiry - now) / 1000);
+                    btn.disabled = true;
+                    btn.classList.add('bg-slate-200', 'text-slate-500', 'cursor-not-allowed');
+                    btn.classList.remove('bg-blue-600', 'hover:bg-blue-700', 'text-white');
+                    btn.querySelector('.btn-text').innerText = `Wait ${remaining}s`;
+                } else if (expiry && now >= expiry) {
+                    localStorage.removeItem(`email_cooldown_${id}`);
+                    btn.disabled = false;
+                    btn.classList.remove('bg-slate-200', 'text-slate-500', 'cursor-not-allowed');
+                    btn.classList.add('bg-blue-600', 'hover:bg-blue-700', 'text-white');
+                    btn.querySelector('.btn-text').innerText = `Send`;
+                }
+            });
+        }
+
+        setInterval(checkCooldowns, 1000);
+        window.addEventListener('DOMContentLoaded', checkCooldowns);
+
+        let currentReminderId = null;
+
+        // Reminder Modal Logic
+        window.openReminderModal = (id, w1, d1, h1) => {
+            currentReminderId = id;
+            const modal = document.getElementById('reminderModal');
+            
+            const sentHtml = `<span class="inline-flex items-center gap-1.5 bg-emerald-100/50 text-emerald-600 px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider"><i class="fas fa-check-circle"></i> Sent</span>`;
+            const pendingHtml = `<span class="inline-flex items-center gap-1.5 bg-slate-100 text-slate-500 px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider"><i class="fas fa-clock"></i> Pending</span>`;
+            
+            document.getElementById('remStatus1w').innerHTML = w1 ? sentHtml : pendingHtml;
+            document.getElementById('remStatus1d').innerHTML = d1 ? sentHtml : pendingHtml;
+            document.getElementById('remStatus1h').innerHTML = h1 ? sentHtml : pendingHtml;
+            
+            modal.classList.remove('hidden');
+        };
+
+        window.closeReminderModal = () => {
+            document.getElementById('reminderModal').classList.add('hidden');
+        };
+
+        window.forceRunCronJobs = async () => {
+            if (!currentReminderId) return;
+            const btn = document.getElementById('forceRunCronBtn');
+            const originalContent = btn.innerHTML;
+            btn.innerHTML = `<i class="fas fa-circle-notch loading-spinner"></i> Processing...`;
+            btn.disabled = true;
+            btn.classList.add('opacity-50', 'cursor-not-allowed');
+
+            try {
+                const response = await fetch(`cron_reminders.php?token=manual_trigger_492&force_id=${currentReminderId}`);
+                const text = await response.text();
+                
+                if (window.DynamicIsland) {
+                    DynamicIsland.notify({
+                        type: 'success',
+                        title: 'Reminders Executed',
+                        message: 'The reminder job was successfully triggered manually.'
+                    });
+                }
+                
+                // Refresh page after a short delay to reflect any new "Sent" statuses
+                setTimeout(() => {
+                    window.location.reload();
+                }, 2000);
+            } catch (error) {
+                if (window.DynamicIsland) {
+                    DynamicIsland.notify({
+                        type: 'error',
+                        title: 'Execution Failed',
+                        message: 'Could not trigger the reminder job manually.'
+                    });
+                }
+                btn.innerHTML = originalContent;
+                btn.disabled = false;
+                btn.classList.remove('opacity-50', 'cursor-not-allowed');
+            }
+        };
+
+        // Close on Esc
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                closeSendModal();
+                closeReminderModal();
+            }
+        });
+
+        // Initialize Dynamic Island for Flash Messages
+        <?php if (isset($_SESSION['di'])): ?>
+        window.addEventListener('DOMContentLoaded', () => {
+            if (window.DynamicIsland) {
+                const di = <?php echo json_encode($_SESSION['di']); ?>;
+                DynamicIsland.notify(di);
+            }
+        });
+        <?php unset($_SESSION['di']); endif; ?>
+
+        // Action Handlers
+        window.handleBulkAction = (action) => {
+            const selectedIds = Array.from(rowCheckboxes)
+                .filter(cb => cb.checked)
+                .map(cb => cb.getAttribute('data-id'));
+
+            if (selectedIds.length === 0) return;
+
+            if (action === 'delete') {
+                if (confirm(`Are you sure you want to delete ${selectedIds.length} registrants?`)) {
+                    document.getElementById('bulk-delete-ids').value = selectedIds.join(',');
+                    document.getElementById('bulk-delete-form').submit();
+                }
+            } else if (action === 'send') {
+                if (confirm(`Send emails to ${selectedIds.length} registrants?`)) {
+                    document.getElementById('bulk-send-ids').value = selectedIds.join(',');
+                    document.getElementById('bulk-send-form').submit();
+                }
+            } else if (action === 'export_pdf') {
+                window.print();
+            }
+        };
+
+        // Real-Time Auto Refresh (AJAX Polling every 20s)
+        setInterval(() => {
+            // First check if elements exist
+            const emailModalEl = document.getElementById('emailModal');
+            const reminderModalEl = document.getElementById('reminderModal');
+            
+            // Check if user is interacting with checkboxes. If yes, skip refresh to prevent losing selection.
+            const hasChecked = document.querySelectorAll('.row-select:checked').length > 0;
+            const isModalOpen = (emailModalEl && !emailModalEl.classList.contains('hidden')) || 
+                            (reminderModalEl && !reminderModalEl.classList.contains('hidden'));
+            
+            if (hasChecked || isModalOpen) return;
+
+            const url = new URL(window.location.href);
+            url.searchParams.set('_', Date.now());
+
+            fetch(url)
+                .then(res => res.text())
+                .then(html => {
+                    const parser = new DOMParser();
+                    const doc = parser.parseFromString(html, 'text/html');
+                    
+                    const newContainer = doc.getElementById('registrants-container');
+                    const oldContainer = document.getElementById('registrants-container');
+                    
+                    if (newContainer && oldContainer) {
+                        oldContainer.innerHTML = newContainer.innerHTML;
+                        // Re-attach event listeners for checkboxes
+                        attachCheckboxListeners();
+                    }
+                })
+                .catch(err => console.error("Auto-refresh failed", err));
+        }, 20000);
+
+        function attachCheckboxListeners() {
+            const selectAll = document.getElementById('select-all');
+            const rowCheckboxes = document.querySelectorAll('.row-select');
+            const bulkToolbar = document.getElementById('bulk-toolbar');
+            const selectedCountSpan = document.getElementById('selected-count');
+
+            if(selectAll) {
+                selectAll.addEventListener('change', (e) => {
+                    rowCheckboxes.forEach(cb => cb.checked = e.target.checked);
+                    updateToolbar();
+                });
+            }
+
+            rowCheckboxes.forEach(cb => {
+                cb.addEventListener('change', () => {
+                    updateToolbar();
+                    if(selectAll) selectAll.checked = Array.from(rowCheckboxes).every(c => c.checked);
+                });
+            });
+
+            function updateToolbar() {
+                const count = Array.from(rowCheckboxes).filter(cb => cb.checked).length;
+                if(selectedCountSpan) selectedCountSpan.textContent = count;
+                if(bulkToolbar) {
+                    if (count > 0) {
+                        bulkToolbar.classList.remove('hidden');
+                        bulkToolbar.classList.add('flex');
+                    } else {
+                        bulkToolbar.classList.add('hidden');
+                        bulkToolbar.classList.remove('flex');
+                    }
+                }
+            }
+        }
+    </script>
+</body>
+</html>
