@@ -122,5 +122,23 @@ if (!function_exists('env')) {
     }
 }
 
+if (!function_exists('env_raw')) {
+    /**
+     * Get an environment value where an empty string is a legitimate value
+     * (e.g. DB_PASS for passwordless MySQL accounts). Falls back to the
+     * default ONLY when the variable is not set at all.
+     */
+    function env_raw($key, $default = null) {
+        $value = getenv($key);
+        if ($value === false && isset($_ENV[$key])) {
+            $value = $_ENV[$key];
+        }
+        if ($value === false || $value === null) {
+            return $default;
+        }
+        return $value;
+    }
+}
+
 // Auto-load the project-root .env when this file is required.
 load_env(__DIR__ . '/.env');
