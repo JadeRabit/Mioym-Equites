@@ -2,3 +2,6 @@
 .opencode/
 openspec/
 openspecs/
+
+# Environment secrets - never commit real credentials
+.env

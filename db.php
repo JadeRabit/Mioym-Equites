@@ -1,10 +1,13 @@
 <?php
-$host = 'localhost';
-$dbname = 'webinar_db';
+// Load environment variables from .env (optional; falls back to defaults below).
+require_once __DIR__ . '/env.php';
+
+$host = env('DB_HOST', 'localhost');
+$dbname = env('DB_NAME', 'webinar_db');
 // $username = 'root';
 // $password = '';
-$username = 'mioymadmin'; // Default XAMPP username
-$password = 'Mioym$1234!!!';     // Default XAMPP password
+$username = env('DB_USER', 'mioymadmin'); // Default XAMPP username
+$password = env('DB_PASS', 'Mioym$1234!!!');     // Default XAMPP password
 
 try {
     $pdo = new PDO("mysql:host=$host;dbname=$dbname;charset=utf8mb4", $username, $password);
